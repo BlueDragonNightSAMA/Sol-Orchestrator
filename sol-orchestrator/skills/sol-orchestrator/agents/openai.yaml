@@ -1,0 +1,11 @@
+interface:
+  display_name: "Sol Orchestrator"
+  short_description: "Resumable Sol goals with host-agent task conversations"
+  default_prompt: "Use $sol-orchestrator. Open the Chinese model configuration window when visual selection is requested; otherwise run this /gaol with host-agent task conversations when available, resumable checkpoints, and independent completion review."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "sol-orchestrator"
+      description: "Local Sol, Terra, and Luna orchestration server"
+policy:
+  allow_implicit_invocation: true
