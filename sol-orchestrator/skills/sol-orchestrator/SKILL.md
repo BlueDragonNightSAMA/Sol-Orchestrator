@@ -1,14 +1,14 @@
 ---
 name: sol-orchestrator
-description: Plan projects with Sol, minimize tokens, select reasoning effort, recover failed tasks, create host subagent task conversations when available, delegate to Terra or Luna, continue long goals idempotently, and require independent Sol review. Use for token-efficient multi-model planning, N-way subagent dispatch, visible routing, resumable execution, or automatic local handoffs.
+description: Classify every new conversation when enabled, then decide whether to handle it directly or use Sol for token-efficient planning, host subagents, Terra/Luna delegation, resumable execution, and independent review. Use at conversation start for routing, and for multi-model planning, N-way dispatch, long goals, recovery, or automatic local handoffs.
 ---
 
 # Sol Orchestrator
 
 Use the `sol-orchestrator` MCP tools. Keep chat output concise and auditable.
 
-1. Call `get_config` before the first run.
-2. If the user asks for a model-selection window or finds chat configuration difficult, call `open_config_window` and relay its `chatDisplay`. The local Chinese window edits models, endpoints, reasoning strengths, task counts, token policy, and automatic mode for that workspace. Otherwise call `configure` directly. Store only API-key environment variable names; never store key values. Use `reasoningEffort` per profile and `tokenMode` for `economy`, `balanced`, or `quality`.
+1. At the beginning of every new conversation, call `get_config` once. `enabled` defaults to `true`. If it is `false`, stop using this skill for that conversation: do not classify, plan, create artifacts, call models, dispatch agents, review, resume, or query run status. Continue with normal Codex behavior unless the user explicitly asks to open settings or re-enable the plugin. When enabled, classify the request internally as `direct` (simple answer or narrow task in the primary context), `inspect` (read-only analysis/review), `orchestrated` (multi-step, parallel, or specialist work), or `continuous` (a long-running goal). Do not expose this label unless it helps the user. Only the last two classes should incur orchestration model calls.
+2. If the user asks for a model-selection window, a tuning dashboard, or finds chat configuration difficult, call `open_config_window` and relay its `chatDisplay`. The local Chinese dashboard previews the Sol-worker-review route and output budgets while editing models, endpoints, reasoning strengths, task counts, concurrency, archive settings, token policy, and automatic mode for that workspace. Its per-profile connection test uses `GET /models` and consumes no generation tokens. Otherwise call `configure` directly. Store only API-key environment variable names; never store key values. Use `reasoningEffort` per profile and `tokenMode` for `economy`, `balanced`, or `quality`.
 3. Treat text after `/gaol` as the final goal. Preserve the exact `/gaol <goal>` line in every project card and final result.
 4. For `/gaol` work that spans multiple batches, pass `longRunning: true`. Never equate an approved batch with a completed goal.
 5. For normal execution, call `plan_workflow`, immediately relay its `chatDisplay` verbatim, then call `execute_run` and relay its final `chatDisplay` verbatim. This makes project ID, task ID, model, reasoning, content, and status visible before and after execution.
@@ -30,5 +30,6 @@ Use the `sol-orchestrator` MCP tools. Keep chat output concise and auditable.
 21. Let the MCP server batch independent Sol reviews automatically: economy reviews up to four results per call, balanced up to two, and quality reviews one at a time. Each task still receives its own review document; malformed batch output falls back to individual review.
 22. Respect local task deduplication. Exact normalized duplicates are skipped within a batch and against approved prior batches, and `chatDisplay` reports the count. Never recreate skipped packets manually. A completed task that is an explicit dependency is conservatively retained unless its result can be safely supplied.
 23. Treat the returned `projectId` as authoritative. Project numbers are allocated with a cross-process workspace lock, so parallel Codex conversations must not invent or override IDs.
+24. For very large workspace files, pass paths and bounded task-specific excerpts instead of embedding file contents in `goal` or `context`. Result and dependency review uses bounded head/tail previews while preserving original files. A compact run larger than the safe bundle threshold automatically remains split; do not force it into one `run-bundle.json`.
 
 Read [protocol.md](references/protocol.md) only when configuring endpoints, integrating external workers, or troubleshooting run files.

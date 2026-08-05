@@ -24,9 +24,13 @@ Use `maxTokensField: "max_completion_tokens"` when required by the endpoint, or 
 
 ## Configuration window
 
-Call `open_config_window` when the user wants visual model selection. It starts an ephemeral Chinese configuration page on `127.0.0.1`, binds it to the requested workspace, and returns a clickable URL. Each random session expires after 30 minutes. The page can add, remove, or rename profiles; choose Sol, reviewer, and worker roles; select reasoning effort; set automatic or fixed task counts; and edit execution, token, archive, retry, and endpoint options.
+Call `open_config_window` when the user wants visual model selection or orchestration tuning. It starts an ephemeral Chinese configuration page on `127.0.0.1`, binds it to the requested workspace, and returns a clickable URL. Each random session expires after 30 minutes. The page previews the active Sol-worker-review route and phase output budgets. It can add, remove, or rename profiles; choose Sol, reviewer, and worker roles; select reasoning effort; set automatic or fixed task counts; and edit execution, token, archive directory, retry, and endpoint options.
 
-The page stores only API-key environment variable names. It never accepts or persists API-key values. A visual save replaces the complete profile list so deleted profiles do not remain as hidden configuration. Configuration writes are atomic and carry a revision token: a stale window receives HTTP 409 instead of overwriting a newer chat or window update. The page marks unsaved changes, warns before closing, validates task limits and environment-variable names locally, and shows endpoint/key readiness without calling any model.
+The workspace `enabled` setting defaults to `true`, so implicit skill invocation can classify each new conversation before choosing direct handling or orchestration. Setting it to `false` is a functional kill switch: planning, execution, review, continuation, status, connection tests, agent dispatch, artifact creation, and model calls are blocked. `get_config`, `configure`, and `open_config_window` remain available only so the user can inspect the state or re-enable it. To prevent the skill and MCP server from loading at all, disable the installed plugin in Codex; a running plugin cannot unload itself.
+
+The page stores only API-key environment variable names. It never accepts or persists API-key values. A visual save replaces the complete profile list so deleted profiles do not remain as hidden configuration. Configuration writes are atomic and carry a revision token: a stale window receives HTTP 409 instead of overwriting a newer chat or window update. The page marks unsaved changes, warns before closing, and validates task limits and environment-variable names locally.
+
+Each profile has a zero-generation-token connection test. It calls the OpenAI-compatible `GET /models` endpoint with a nine-second timeout, checks whether the configured model ID exists, and distinguishes authentication failure, missing environment keys, unsupported model-list endpoints, malformed responses, timeouts, and unreachable services. Remote plaintext HTTP is blocked; loopback HTTP and HTTPS are allowed. The test route is protected by the same expiring configuration session and strict same-origin POST checks as configuration writes. At most four tests run concurrently; excess requests receive HTTP 429 instead of forming an unbounded queue.
 
 ## Token modes
 
@@ -34,7 +38,7 @@ The page stores only API-key environment variable names. It never accepts or per
 - `balanced`: delegated tasks receive at most 4,000 goal characters, with larger task/review budgets plus a Sol final synthesis.
 - `quality`: delegated tasks receive at most 12,000 goal characters and the largest budgets for high-risk work.
 
-Every API call is recorded in `usage.json` while a batch is active and moved into `run-bundle.json` during compact archiving. When the endpoint returns usage metadata it is used directly; otherwise the plugin records a conservative local estimate. Local task and result documents remain complete even when inter-model context is clipped.
+Every API call appends one small record to `usage.jsonl` instead of reading and serializing the complete usage history after every request. Usage is aggregated into `run-bundle.json` or the final state during archiving. Legacy `usage.json` files remain readable. When the endpoint returns usage metadata it is used directly; otherwise the plugin records a conservative local estimate. Local task and result documents remain complete even when inter-model context is clipped.
 
 Independent reviews share context without sharing decisions. Economy mode reviews up to four task results per Sol call, balanced mode up to two, and quality mode keeps one result per call. The server writes one review document per task in every mode. Missing task IDs or malformed batch JSON triggers an automatic individual-review fallback. This batching applies to both API-parallel waves and host-agent result collection.
 
@@ -43,6 +47,8 @@ Independent reviews share context without sharing decisions. Economy mode review
 Pass `longRunning: true` for a long-lived `/gaol`. An approved batch returns `needsContinuation: true`, not goal completion. Call `continue_goal` with the latest run directory. Sol receives only the goal and compact review summaries; it either creates the next batch under the same project ID or returns `goal_complete` with completion evidence. Empty continuation plans are replaced with a Sol-owned progress task so task exhaustion cannot block the project.
 
 `continue_goal` is idempotent. Repeating it for the same batch returns the existing successor; a project lock prevents concurrent calls from creating two B02 branches. A completion claim is sent to `reviewModel` in a separate call and becomes `goal_complete` only when that independent verification approves it.
+
+Within one continuation call, the previous state, plan, reviews, and optional compact bundle are loaded once and reused through planning and the final `continuedBy` checkpoint. This avoids repeatedly parsing and serializing the same archive during long goals.
 
 Each successor stores a bounded cross-batch progress ledger. Continuation calls send compact review decisions, progress digests, and unresolved findings instead of complete review templates. Economy mode caps the ledger at 5,000 characters while preserving the first and most recent progress entries, preventing both long-goal amnesia and unbounded prompt growth.
 
@@ -83,7 +89,15 @@ sol-orchestrator-projects/
 
 `PROJECT.md` contains the final goal, latest batch, task/model summary, and the prompt required to continue. In default `compact` mode, completed batch files are merged into `run-bundle.json`; only the bundle and final review remain. Set `artifactMode: expanded` only when every intermediate handoff file must remain separate.
 
-Project numbers use an atomic cross-process counter lock. When multiple Codex conversations plan simultaneously, each receives a different `Pxxxx`. If `counter.json` is missing or behind, the allocator scans existing `Pxxxx` folders before issuing the next ID. The temporary lock is removed after allocation and stale locks are recoverable.
+## Large-file memory safety
+
+Large workspace inputs should be referenced by path rather than embedded in `goal` or `context`. The plugin caps embedded goal and context sizes before creating project documents. Host-agent results remain complete on disk, but Sol review reads bounded head/tail previews, including an explicit omitted-byte marker. Dependency context uses the same bounded preview strategy.
+
+Model responses are streamed with a two-MiB hard limit, `/models` responses with a four-MiB limit, plugin JSON reads with a sixteen-MiB limit, and an incomplete MCP input buffer with a four-MiB limit. Oversized responses fail cleanly instead of being buffered without bound. Token usage is append-only during execution, and API-parallel state is checkpointed per wave rather than once per task transition.
+
+Before compacting, the server sums source artifact sizes. Runs up to eight MiB use the normal two-file compact layout. Larger runs automatically keep their split task/result/review files and record `compaction.mode: split`; this avoids constructing and serializing a giant `run-bundle.json`. The final chat card and `PROJECT.md` show whether the run was bundled or kept split.
+
+Project numbers use an atomic cross-process counter lock. When multiple Codex conversations plan simultaneously, each receives a different `Pxxxx`. A healthy counter uses an `O(1)` candidate check. If `counter.json` is missing, damaged, or collides with an existing candidate, the allocator streams existing `Pxxxx` entries without loading the full directory list. The temporary lock is removed after allocation and stale locks are recoverable.
 
 ## Modes
 
@@ -117,7 +131,7 @@ results/<task-id>.result.md
 reviews/<task-id>.review.md
 final-review.md
 state.json
-usage.json
+usage.jsonl
 ```
 
 Workers receive only their prompt document. Sol receives the original request, plan, worker result, and acceptance criteria during review.

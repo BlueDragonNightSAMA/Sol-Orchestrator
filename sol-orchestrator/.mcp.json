@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "sol-orchestrator": {
+      "command": "node",
+      "args": [
+        "./server/index.mjs"
+      ]
+    }
+  }
+}

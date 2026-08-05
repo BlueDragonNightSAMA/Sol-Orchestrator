@@ -1,0 +1,35 @@
+{
+  "name": "sol-orchestrator",
+  "version": "0.2.1+codex.20260805081309",
+  "description": "Classify conversations by default, route work visually, and fully pause Sol orchestration per workspace when needed.",
+  "author": {
+    "name": "Local developer"
+  },
+  "license": "MIT",
+  "keywords": [
+    "sol",
+    "terra",
+    "luna",
+    "orchestration",
+    "local-documents"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Sol Orchestrator",
+    "shortDescription": "Default-on routing with a workspace off switch.",
+    "longDescription": "A Chinese orchestration dashboard that defaults to classifying each new conversation, routes simple work locally, previews Sol-worker-review budgets, and provides a workspace kill switch that blocks planning, execution, review, status, artifacts, agent dispatch, endpoint tests, and model calls until re-enabled.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write",
+      "Local files"
+    ],
+    "brandColor": "#0F766E",
+    "defaultPrompt": [
+      "Open the Sol Orchestrator tuning dashboard.",
+      "Classify this request and orchestrate only when justified."
+    ]
+  }
+}

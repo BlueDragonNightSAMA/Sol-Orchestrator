@@ -2,20 +2,33 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { createReadStream, promises as fs } from "node:fs";
 import { createServer } from "node:http";
 import path from "node:path";
+import { createInterface } from "node:readline";
 
-const SERVER = { name: "sol-orchestrator", version: "0.2.0" };
+const SERVER = { name: "sol-orchestrator", version: "0.2.1" };
 const REASONING_EFFORTS = ["default", "none", "minimal", "low", "medium", "high", "xhigh"];
 const TOKEN_MODES = ["economy", "balanced", "quality"];
 const EXECUTION_BACKENDS = ["auto", "api-parallel", "host-agents"];
+const MIB = 1024 * 1024;
+const MAX_JSON_FILE_BYTES = 16 * MIB;
+const MAX_TEXT_PREVIEW_BYTES = 256 * 1024;
+const MAX_MODEL_RESPONSE_BYTES = 2 * MIB;
+const MAX_MODELS_RESPONSE_BYTES = 4 * MIB;
+const MAX_ERROR_RESPONSE_BYTES = 64 * 1024;
+const MAX_COMPACT_SOURCE_BYTES = 8 * MIB;
+const MAX_GOAL_CHARS = 256 * 1024;
+const MAX_CONTEXT_CHARS = 512 * 1024;
+const MAX_USAGE_CALLS = 4096;
+const MAX_MCP_BUFFER_BYTES = 4 * MIB;
 const TOKEN_POLICIES = {
   economy: { planning: 1400, worker: 1200, review: 420, final: 500, goalChars: 6000, delegatedGoalChars: 1200, contextChars: 6000, planChars: 1800, taskChars: 4000, dependencyChars: 3000, reviewResultChars: 7000, reviewBatchChars: 10000, reviewBatchSize: 4, finalReviewChars: 1800, reviewSummaryChars: 900, progressLedgerChars: 5000 },
   balanced: { planning: 2400, worker: 2400, review: 700, final: 900, goalChars: 12000, delegatedGoalChars: 4000, contextChars: 12000, planChars: 3500, taskChars: 8000, dependencyChars: 6000, reviewResultChars: 14000, reviewBatchChars: 18000, reviewBatchSize: 2, finalReviewChars: 3200, reviewSummaryChars: 1600, progressLedgerChars: 9000 },
   quality: { planning: 4200, worker: 5000, review: 1200, final: 1800, goalChars: 24000, delegatedGoalChars: 12000, contextChars: 24000, planChars: 7000, taskChars: 16000, dependencyChars: 12000, reviewResultChars: 24000, reviewBatchChars: 24000, reviewBatchSize: 1, finalReviewChars: 6000, reviewSummaryChars: 2800, progressLedgerChars: 16000 }
 };
 const DEFAULTS = {
+  enabled: true,
   mode: "auto",
   tokenMode: "economy",
   artifactMode: "compact",
@@ -51,16 +64,17 @@ const TOOLS = [
   },
   {
     name: "get_config",
-    description: "Read the workspace orchestration configuration without exposing API key values.",
+    description: "Read whether orchestration is enabled and the workspace configuration without exposing API key values.",
     inputSchema: workspaceSchema()
   },
   {
     name: "configure",
-    description: "Configure automatic/manual mode, task count, and deployed OpenAI-compatible model profiles.",
+    description: "Enable or disable orchestration and configure task routing plus deployed OpenAI-compatible model profiles.",
     inputSchema: {
       type: "object",
       properties: {
         workspace: { type: "string", description: "Project root. Defaults to the current workspace." },
+        enabled: { type: "boolean", description: "Defaults to true. False blocks classification workflows, planning, execution, review, continuation, and status tools until re-enabled." },
         mode: { type: "string", enum: ["auto", "manual", "documents"] },
         tokenMode: { type: "string", enum: TOKEN_MODES, description: "economy is the default; quality restores larger context and output limits." },
         artifactMode: { type: "string", enum: ["compact", "expanded"], description: "compact keeps two files after review; expanded keeps every handoff file." },
@@ -192,8 +206,8 @@ function runSchema(withExecution) {
     type: "object",
     required: ["goal"],
     properties: {
-      goal: { type: "string", description: "The complete project goal and constraints." },
-      projectName: { type: "string", description: "Short project name shown in chat review cards." },
+      goal: { type: "string", maxLength: MAX_GOAL_CHARS, description: "The complete project goal and constraints. Refer to large workspace files by path instead of embedding them." },
+      projectName: { type: "string", maxLength: 256, description: "Short project name shown in chat review cards." },
       longRunning: { type: "boolean", description: "Keep the /gaol active and request another batch until Sol proves the final goal complete." },
       workspace: { type: "string" },
       taskCount: { type: "integer", minimum: 1, maximum: 64 },
@@ -202,7 +216,7 @@ function runSchema(withExecution) {
       reasoningByModel: { type: "object", additionalProperties: { type: "string", enum: REASONING_EFFORTS }, description: "Per-profile effort overrides, for example sol-5.6: high." },
       tokenMode: { type: "string", enum: TOKEN_MODES, description: "Temporary token policy override." },
       executionBackend: { type: "string", enum: EXECUTION_BACKENDS, description: "host-agents prepares subagent task packets; api-parallel calls deployed model endpoints." },
-      context: { type: "string", description: "Optional concise project context." },
+      context: { type: "string", maxLength: MAX_CONTEXT_CHARS, description: "Optional concise project context. Refer to large workspace files by path." },
       execute: withExecution ? { type: "boolean", const: true } : { type: "boolean", const: false }
     }
   };
@@ -245,6 +259,7 @@ async function writeProjectDocument(state, plan, dir, config) {
     `- Run directory: ${dir}`,
     `- Token mode: ${state.tokenMode || config.tokenMode}`,
     `- Artifact mode: ${state.artifactMode || config.artifactMode}`,
+    `- Compaction: ${state.compaction?.mode || "pending"}${state.compaction?.reason ? ` (${state.compaction.reason})` : ""}`,
     "",
     "## Current tasks",
     "",
@@ -259,8 +274,80 @@ async function writeProjectDocument(state, plan, dir, config) {
   return file;
 }
 
-async function readJson(file) {
-  return JSON.parse(await fs.readFile(file, "utf8"));
+function sizeLimitError(file, size, limit, kind = "File") {
+  const error = new Error(`${kind} exceeds the in-memory safety limit: ${file} (${size} bytes > ${limit} bytes). Keep large inputs as workspace files and pass paths or bounded excerpts.`);
+  error.code = "FILE_SIZE_LIMIT";
+  error.size = size;
+  error.limit = limit;
+  return error;
+}
+
+async function readUtf8Bounded(file, maxBytes, kind = "File") {
+  const handle = await fs.open(file, "r");
+  try {
+    const stat = await handle.stat();
+    if (stat.size > maxBytes) throw sizeLimitError(file, stat.size, maxBytes, kind);
+    if (!stat.size) return "";
+    const buffer = Buffer.allocUnsafe(stat.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    return buffer.subarray(0, offset).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function headTail(text, maxChars, marker) {
+  if (text.length <= maxChars) return text;
+  const separator = `\n${marker}\n`;
+  const remaining = Math.max(0, maxChars - separator.length);
+  const headChars = Math.ceil(remaining * 0.65);
+  const tailChars = remaining - headChars;
+  return `${text.slice(0, headChars)}${separator}${tailChars ? text.slice(-tailChars) : ""}`;
+}
+
+async function readTextPreview(file, maxChars, optional = false) {
+  const handle = await fs.open(file, "r").catch((error) => {
+    if (optional && error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!handle) return "";
+  try {
+    const stat = await handle.stat();
+    if (!stat.size) return "";
+    const maxBytes = Math.min(MAX_TEXT_PREVIEW_BYTES, Math.max(4096, maxChars * 4));
+    if (stat.size <= maxBytes) {
+      const buffer = Buffer.allocUnsafe(stat.size);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      return headTail(buffer.subarray(0, bytesRead).toString("utf8"), maxChars, "[middle omitted from review preview]");
+    }
+    const headBytes = Math.ceil(maxBytes * 0.65);
+    const tailBytes = maxBytes - headBytes;
+    const head = Buffer.allocUnsafe(headBytes);
+    const tail = Buffer.allocUnsafe(tailBytes);
+    const [{ bytesRead: headRead }, { bytesRead: tailRead }] = await Promise.all([
+      handle.read(head, 0, head.length, 0),
+      handle.read(tail, 0, tail.length, stat.size - tail.length)
+    ]);
+    const marker = `[${stat.size - headRead - tailRead} file bytes omitted from review preview]`;
+    const combined = `${head.subarray(0, headRead).toString("utf8")}\n${marker}\n${tail.subarray(0, tailRead).toString("utf8")}`;
+    return headTail(combined, maxChars, marker);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function hasNonEmptyFile(file) {
+  try { return (await fs.stat(file)).size > 0; }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+}
+
+async function readJson(file, maxBytes = MAX_JSON_FILE_BYTES) {
+  return JSON.parse(await readUtf8Bounded(file, maxBytes, "JSON file"));
 }
 
 async function writeJson(file, value) {
@@ -321,6 +408,7 @@ async function loadConfig(workspace) {
 
 function validateConfig(config) {
   if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("config must be an object");
+  if (typeof config.enabled !== "boolean") throw new Error("enabled must be a boolean");
   if (!["auto", "manual", "documents"].includes(config.mode)) throw new Error("mode must be auto, manual, or documents");
   if (!TOKEN_MODES.includes(config.tokenMode)) throw new Error("tokenMode must be economy, balanced, or quality");
   if (!["compact", "expanded"].includes(config.artifactMode)) throw new Error("artifactMode must be compact or expanded");
@@ -336,6 +424,7 @@ function validateConfig(config) {
   if (!Number.isInteger(config.maxRetries) || config.maxRetries < 0 || config.maxRetries > 8) throw new Error("maxRetries must be between 0 and 8");
   if (!Number.isInteger(config.retryBaseMs) || config.retryBaseMs < 100 || config.retryBaseMs > 30000) throw new Error("retryBaseMs must be between 100 and 30000");
   if (!config.models || typeof config.models !== "object" || Array.isArray(config.models) || !Object.keys(config.models).length) throw new Error("At least one model profile is required");
+  if (Object.keys(config.models).length > 64) throw new Error("At most 64 model profiles are allowed");
   if (typeof config.solModel !== "string" || typeof config.reviewModel !== "string") throw new Error("solModel and reviewModel must be strings");
   if (!Array.isArray(config.workerModels) || !config.workerModels.length || config.workerModels.some((name) => typeof name !== "string")) throw new Error("workerModels must contain at least one profile name");
   for (const name of [config.solModel, config.reviewModel, ...config.workerModels]) {
@@ -343,9 +432,12 @@ function validateConfig(config) {
   }
   for (const [name, profile] of Object.entries(config.models)) {
     if (!name.trim() || name !== name.trim()) throw new Error("Model profile names must be non-empty and cannot start or end with spaces");
+    if (name.length > 128) throw new Error("Model profile names cannot exceed 128 characters");
     if (!profile || typeof profile !== "object" || Array.isArray(profile)) throw new Error(`Model profile '${name}' must be an object`);
     if (!profile.model || typeof profile.model !== "string" || !profile.model.trim()) throw new Error(`Model profile '${name}' requires model`);
+    if (profile.model.length > 512) throw new Error(`model for '${name}' cannot exceed 512 characters`);
     if (typeof profile.baseUrl !== "string") throw new Error(`Model profile '${name}' requires baseUrl`);
+    if (profile.baseUrl.length > 2048) throw new Error(`baseUrl for '${name}' cannot exceed 2048 characters`);
     if (profile.baseUrl) {
       let endpointUrl;
       try { endpointUrl = new URL(profile.baseUrl); }
@@ -354,8 +446,8 @@ function validateConfig(config) {
     }
     if (typeof profile.apiKeyEnv !== "string" || (profile.apiKeyEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(profile.apiKeyEnv))) throw new Error(`apiKeyEnv for '${name}' must be a valid environment variable name`);
     if (!REASONING_EFFORTS.includes(profile.reasoningEffort)) throw new Error(`Invalid reasoningEffort for '${name}'`);
-    if (typeof profile.reasoningField !== "string") throw new Error(`reasoningField for '${name}' must be a string`);
-    if (typeof profile.maxTokensField !== "string") throw new Error(`maxTokensField for '${name}' must be a string`);
+    if (typeof profile.reasoningField !== "string" || profile.reasoningField.length > 128) throw new Error(`reasoningField for '${name}' must be a string of at most 128 characters`);
+    if (typeof profile.maxTokensField !== "string" || profile.maxTokensField.length > 128) throw new Error(`maxTokensField for '${name}' must be a string of at most 128 characters`);
     if (typeof profile.temperatureEnabled !== "boolean") throw new Error(`temperatureEnabled for '${name}' must be a boolean`);
   }
   return config;
@@ -365,7 +457,7 @@ async function configure(args) {
   const workspace = workspaceRoot(args.workspace);
   const current = await loadConfig(workspace);
   const next = structuredClone(current);
-  for (const key of ["mode", "tokenMode", "artifactMode", "artifactDirectory", "executionBackend", "tasksPerBatch", "maxTasksPerRun", "maxParallel", "requestTimeoutMs", "maxRetries", "retryBaseMs", "solModel", "reviewModel", "workerModels"]) {
+  for (const key of ["enabled", "mode", "tokenMode", "artifactMode", "artifactDirectory", "executionBackend", "tasksPerBatch", "maxTasksPerRun", "maxParallel", "requestTimeoutMs", "maxRetries", "retryBaseMs", "solModel", "reviewModel", "workerModels"]) {
     if (args[key] !== undefined) next[key] = args[key];
   }
   if (args.replaceProfiles) {
@@ -400,6 +492,13 @@ async function configure(args) {
   return { configured: true, configPath: file, revision: configRevision(next), config: redactConfig(next) };
 }
 
+function requireEnabled(config) {
+  if (config.enabled) return config;
+  const error = new Error("Sol Orchestrator is disabled for this workspace. Re-enable it in the tuning dashboard or with configure({ enabled: true }).");
+  error.code = "SOL_ORCHESTRATOR_DISABLED";
+  throw error;
+}
+
 function configRevision(config) {
   const canonical = (value) => {
     if (Array.isArray(value)) return value.map(canonical);
@@ -425,6 +524,9 @@ const configUiSessions = new Map();
 const CONFIG_UI_SESSION_MS = 30 * 60 * 1000;
 const CONFIG_UI_MAX_BODY = 64 * 1024;
 const CONFIG_UI_MAX_SESSIONS = 32;
+const CONFIG_UI_MAX_PROFILE_TESTS = 4;
+const PROFILE_TEST_TIMEOUT_MS = 9000;
+let activeProfileTests = 0;
 
 function sendHttpJson(response, status, value) {
   if (response.writableEnded) return;
@@ -462,8 +564,147 @@ async function readHttpJson(request) {
   return value;
 }
 
+function responseLimitError(limit) {
+  const error = new Error(`HTTP response exceeded the ${limit}-byte in-memory safety limit.`);
+  error.code = "RESPONSE_SIZE_LIMIT";
+  error.limit = limit;
+  return error;
+}
+
+async function readResponseTextBounded(response, maxBytes) {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    throw responseLimitError(maxBytes);
+  }
+  if (!response.body) return "";
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of response.body) {
+    const buffer = Buffer.from(chunk);
+    if (total + buffer.length > maxBytes) throw responseLimitError(maxBytes);
+    chunks.push(buffer);
+    total += buffer.length;
+  }
+  return Buffer.concat(chunks, total).toString("utf8");
+}
+
+async function cancelResponseBody(response) {
+  try { await response.body?.cancel(); }
+  catch {}
+}
+
 async function configUiAsset(name) {
   return fs.readFile(new URL(`./${name}`, import.meta.url));
+}
+
+function trustedConfigUiOrigin(request) {
+  const host = request.headers.host || "";
+  return Boolean(host && request.headers.origin === `http://${host}`);
+}
+
+function profileModelsEndpoint(baseUrl) {
+  const url = new URL(baseUrl.trim());
+  const cleanPath = url.pathname.replace(/\/+$/, "").replace(/\/chat\/completions$/i, "");
+  url.pathname = `${cleanPath}/models`.replace(/\/{2,}/g, "/");
+  url.search = "";
+  url.hash = "";
+  return url;
+}
+
+function isLoopbackHost(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+  return host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+function normalizeProfileTestInput(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("模型测试参数必须是对象。");
+  const profile = {
+    name: typeof raw.name === "string" ? raw.name.trim() : "",
+    model: typeof raw.model === "string" ? raw.model.trim() : "",
+    baseUrl: typeof raw.baseUrl === "string" ? raw.baseUrl.trim() : "",
+    apiKeyEnv: typeof raw.apiKeyEnv === "string" ? raw.apiKeyEnv.trim() : ""
+  };
+  if (!profile.model || profile.model.length > 512) throw new Error("模型 ID 不能为空且不能超过 512 个字符。");
+  if (!profile.baseUrl || profile.baseUrl.length > 2048) throw new Error("Base URL 不能为空且不能超过 2048 个字符。");
+  if (profile.apiKeyEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(profile.apiKeyEnv)) throw new Error("API Key 环境变量名格式不正确。");
+  let url;
+  try { url = profileModelsEndpoint(profile.baseUrl); }
+  catch { throw new Error("Base URL 格式不正确。"); }
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("Base URL 只能使用 HTTP 或 HTTPS。");
+  if (url.username || url.password) throw new Error("Base URL 不能包含用户名或密码。");
+  return { ...profile, url };
+}
+
+function profileTestResult(code, message, extra = {}) {
+  return { ok: code === "available", code, message, tokenUsage: 0, ...extra };
+}
+
+async function testProfileConnection(rawProfile) {
+  const profile = normalizeProfileTestInput(rawProfile);
+  if (profile.url.protocol === "http:" && !isLoopbackHost(profile.url.hostname)) {
+    return profileTestResult("insecure_http", "已阻止远程明文 HTTP 测试，请改用 HTTPS，避免泄露密钥。", { endpointReachable: false });
+  }
+  const key = profile.apiKeyEnv ? process.env[profile.apiKeyEnv] : "";
+  if (profile.apiKeyEnv && !key) {
+    return profileTestResult("api_key_missing", `环境变量 ${profile.apiKeyEnv} 尚未加载。`, { endpointReachable: false });
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROFILE_TEST_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const headers = { accept: "application/json" };
+    if (key) headers.authorization = `Bearer ${key}`;
+    const response = await fetch(profile.url, {
+      method: "GET",
+      headers,
+      redirect: "error",
+      signal: controller.signal
+    });
+    const latencyMs = Date.now() - startedAt;
+    const common = { endpointReachable: true, upstreamStatus: response.status, latencyMs };
+    if ([401, 403].includes(response.status)) {
+      await cancelResponseBody(response);
+      return profileTestResult("auth_failed", `鉴权失败（HTTP ${response.status}），请检查密钥环境变量。`, common);
+    }
+    if ([404, 405].includes(response.status)) {
+      await cancelResponseBody(response);
+      return profileTestResult("models_unsupported", `端点可达，但不支持 GET /models（HTTP ${response.status}），请手工确认模型 ID。`, common);
+    }
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      return profileTestResult("endpoint_error", `端点返回 HTTP ${response.status}，请检查服务状态。`, common);
+    }
+    let payload;
+    try { payload = JSON.parse(await readResponseTextBounded(response, MAX_MODELS_RESPONSE_BYTES)); }
+    catch (error) {
+      const message = error?.code === "RESPONSE_SIZE_LIMIT"
+        ? "端点可达，但 /models 响应过大，已停止读取以保护内存。"
+        : "端点可达，但 /models 未返回有效 JSON。";
+      return profileTestResult("invalid_response", message, common);
+    }
+    const entries = Array.isArray(payload?.data)
+      ? payload.data
+      : Array.isArray(payload?.models)
+        ? payload.models
+        : Array.isArray(payload)
+          ? payload
+          : null;
+    if (!entries) return profileTestResult("invalid_response", "端点可达，但 /models 响应中没有模型列表。", common);
+    const modelIds = entries.map((item) => typeof item === "string" ? item : item?.id).filter((id) => typeof id === "string");
+    const modelCount = modelIds.length;
+    if (!modelIds.includes(profile.model)) {
+      return profileTestResult("model_not_found", `端点可用，但模型列表中未找到 ${profile.model}（共 ${modelCount} 个模型）。`, { ...common, modelCount });
+    }
+    return profileTestResult("available", `连接可用，已找到模型 ${profile.model}（${modelCount} 个模型，${latencyMs} 毫秒）。`, { ...common, modelCount });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      return profileTestResult("timeout", `连接测试超过 ${PROFILE_TEST_TIMEOUT_MS / 1000} 秒。`, { endpointReachable: false, latencyMs: Date.now() - startedAt });
+    }
+    return profileTestResult("unreachable", "无法连接端点，请检查地址、服务和网络。", { endpointReachable: false, latencyMs: Date.now() - startedAt });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function handleConfigUiRequest(request, response) {
@@ -495,9 +736,27 @@ async function handleConfigUiRequest(request, response) {
     sendHttpJson(response, 200, { workspace: session.workspace, revision: configRevision(config), config: redactConfig(config) });
     return;
   }
+  if (request.method === "POST" && url.pathname === "/api/test-profile") {
+    if (!trustedConfigUiOrigin(request)) {
+      sendHttpJson(response, 403, { error: "连接测试来源不受信任。" });
+      return;
+    }
+    if (activeProfileTests >= CONFIG_UI_MAX_PROFILE_TESTS) {
+      sendHttpJson(response, 429, { error: "同时进行的连接测试过多，请稍后重试。" });
+      return;
+    }
+    requireEnabled(await loadConfig(session.workspace));
+    activeProfileTests += 1;
+    try {
+      const body = await readHttpJson(request);
+      sendHttpJson(response, 200, await testProfileConnection(body.profile));
+    } finally {
+      activeProfileTests -= 1;
+    }
+    return;
+  }
   if (request.method === "POST" && url.pathname === "/api/config") {
-    const expectedOrigin = `http://${request.headers.host}`;
-    if (request.headers.origin && request.headers.origin !== expectedOrigin) {
+    if (!trustedConfigUiOrigin(request)) {
       sendHttpJson(response, 403, { error: "配置写入来源不受信任。" });
       return;
     }
@@ -615,22 +874,29 @@ function outputBudget(config, profile, options = {}) {
 
 const usageWrites = new Map();
 
+function emptyUsage() {
+  return { calls: [], totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, byPhase: {} };
+}
+
+function addUsageEntry(usage, entry) {
+  if (usage.calls.length < MAX_USAGE_CALLS) usage.calls.push(entry);
+  else usage.omittedCalls = (usage.omittedCalls || 0) + 1;
+  usage.totals.promptTokens += Number(entry.promptTokens) || 0;
+  usage.totals.completionTokens += Number(entry.completionTokens) || 0;
+  usage.totals.totalTokens += Number(entry.totalTokens) || 0;
+  const phaseName = entry.phase || "unknown";
+  const phase = usage.byPhase[phaseName] || { calls: 0, totalTokens: 0 };
+  phase.calls += 1;
+  phase.totalTokens += Number(entry.totalTokens) || 0;
+  usage.byPhase[phaseName] = phase;
+}
+
 async function recordUsage(file, entry) {
   if (!file) return;
   const previous = usageWrites.get(file) || Promise.resolve();
   const next = previous.then(async () => {
-    let usage = { calls: [], totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, byPhase: {} };
-    try { usage = await readJson(file); }
-    catch (error) { if (error.code !== "ENOENT") throw error; }
-    usage.calls.push(entry);
-    usage.totals.promptTokens += entry.promptTokens;
-    usage.totals.completionTokens += entry.completionTokens;
-    usage.totals.totalTokens += entry.totalTokens;
-    const phase = usage.byPhase[entry.phase] || { calls: 0, totalTokens: 0 };
-    phase.calls += 1;
-    phase.totalTokens += entry.totalTokens;
-    usage.byPhase[entry.phase] = phase;
-    await writeJson(file, usage);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.appendFile(file, `${JSON.stringify(entry)}\n`, "utf8");
   });
   usageWrites.set(file, next);
   try { await next; }
@@ -638,11 +904,36 @@ async function recordUsage(file, entry) {
 }
 
 async function readUsage(dir) {
-  try { return await readJson(path.join(dir, "usage.json")); }
-  catch (error) {
-    if (error.code === "ENOENT") return { calls: [], totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, byPhase: {} };
-    throw error;
+  let usage = emptyUsage();
+  try {
+    const legacy = await readJson(path.join(dir, "usage.json"));
+    if (legacy && typeof legacy === "object") {
+      usage = {
+        calls: Array.isArray(legacy.calls) ? legacy.calls.slice(-MAX_USAGE_CALLS) : [],
+        totals: {
+          promptTokens: Number(legacy.totals?.promptTokens) || 0,
+          completionTokens: Number(legacy.totals?.completionTokens) || 0,
+          totalTokens: Number(legacy.totals?.totalTokens) || 0
+        },
+        byPhase: legacy.byPhase && typeof legacy.byPhase === "object" ? structuredClone(legacy.byPhase) : {},
+        ...(Array.isArray(legacy.calls) && legacy.calls.length > MAX_USAGE_CALLS ? { omittedCalls: legacy.calls.length - MAX_USAGE_CALLS } : {})
+      };
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
   }
+  const logFile = path.join(dir, "usage.jsonl");
+  let logStat;
+  try { logStat = await fs.stat(logFile); }
+  catch (error) { if (error.code === "ENOENT") return usage; throw error; }
+  if (logStat.size > MAX_JSON_FILE_BYTES) throw sizeLimitError(logFile, logStat.size, MAX_JSON_FILE_BYTES, "Usage log");
+  const lines = createInterface({ input: createReadStream(logFile, { encoding: "utf8" }), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line.trim()) continue;
+    try { addUsageEntry(usage, JSON.parse(line)); }
+    catch { usage.droppedEntries = (usage.droppedEntries || 0) + 1; }
+  }
+  return usage;
 }
 
 async function readBundle(dir) {
@@ -657,24 +948,65 @@ async function readRunState(dir) {
   }
 }
 
-async function readRunPlan(dir) {
-  try { return await readJson(path.join(dir, "plan.json")); }
-  catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    return (await readBundle(dir)).plan;
-  }
+async function readRunDocuments(dir) {
+  let state;
+  let plan;
+  try { state = await readJson(path.join(dir, "state.json")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  try { plan = await readJson(path.join(dir, "plan.json")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (state && plan) return { state, plan, bundle: null };
+  const bundle = await readBundle(dir);
+  return { state: bundle.state, plan: bundle.plan, bundle };
 }
 
 async function readOptionalText(file) {
-  try { return await fs.readFile(file, "utf8"); }
+  try { return await readUtf8Bounded(file, MAX_COMPACT_SOURCE_BYTES, "Artifact file"); }
   catch (error) { if (error.code === "ENOENT") return ""; throw error; }
 }
 
-async function compactRun(dir, state, plan) {
+function compactSourceFiles(dir, plan) {
+  const files = [
+    path.join(dir, "request.md"),
+    path.join(dir, "plan.json"),
+    path.join(dir, "plan.md"),
+    path.join(dir, "state.json"),
+    path.join(dir, "usage.json"),
+    path.join(dir, "usage.jsonl"),
+    path.join(dir, "final-review.md")
+  ];
+  for (const task of plan.tasks) {
+    files.push(path.join(dir, "tasks", `${task.id}.prompt.md`));
+    files.push(path.join(dir, "results", `${task.id}.result.md`));
+    files.push(path.join(dir, "reviews", `${task.id}.review.md`));
+  }
+  return files;
+}
+
+async function totalExistingBytes(files) {
+  let total = 0;
+  for (const file of files) {
+    try { total += (await fs.stat(file)).size; }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
+  return total;
+}
+
+async function compactRun(dir, state, plan, config) {
   if (state.artifactMode !== "compact") return state;
   const resolvedDir = path.resolve(dir);
   const allowedRoot = path.resolve(state.projectRoot || path.join(controlRoot(state.workspace), "runs"));
   if (resolvedDir === allowedRoot || !resolvedDir.startsWith(`${allowedRoot}${path.sep}`)) throw new Error("Refusing to compact a directory outside the workspace run root");
+  const bundleFile = path.join(dir, "run-bundle.json");
+  const sourceBytes = await totalExistingBytes(compactSourceFiles(dir, plan));
+  if (sourceBytes > MAX_COMPACT_SOURCE_BYTES) {
+    await fs.rm(bundleFile, { force: true });
+    state.bundlePath = null;
+    state.compaction = { mode: "split", reason: "large_run", sourceBytes, limitBytes: MAX_COMPACT_SOURCE_BYTES };
+    await writeJsonAtomic(path.join(dir, "state.json"), state);
+    await writeProjectDocument(state, plan, dir, config);
+    return state;
+  }
   const prompts = {};
   const results = {};
   const reviews = {};
@@ -683,10 +1015,10 @@ async function compactRun(dir, state, plan) {
     results[task.id] = await readOptionalText(path.join(dir, "results", `${task.id}.result.md`));
     reviews[task.id] = await readOptionalText(path.join(dir, "reviews", `${task.id}.review.md`));
   }
-  const bundleFile = path.join(dir, "run-bundle.json");
   state.bundlePath = bundleFile;
+  state.compaction = { mode: "bundle", sourceBytes, limitBytes: MAX_COMPACT_SOURCE_BYTES };
   const bundle = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     archivedAt: new Date().toISOString(),
     state,
     plan,
@@ -697,9 +1029,19 @@ async function compactRun(dir, state, plan) {
     finalReview: await readOptionalText(path.join(dir, "final-review.md")),
     usage: state.usage || await readUsage(dir)
   };
-  await writeJson(bundleFile, bundle);
+  await writeJsonAtomic(bundleFile, bundle);
+  const bundleBytes = (await fs.stat(bundleFile)).size;
+  if (bundleBytes > MAX_JSON_FILE_BYTES) {
+    await fs.rm(bundleFile, { force: true });
+    state.bundlePath = null;
+    state.compaction = { mode: "split", reason: "bundle_expansion", sourceBytes, bundleBytes, limitBytes: MAX_JSON_FILE_BYTES };
+    await writeJsonAtomic(path.join(dir, "state.json"), state);
+    await writeProjectDocument(state, plan, dir, config);
+    return state;
+  }
+  await writeProjectDocument(state, plan, dir, config);
   for (const folder of ["tasks", "results", "reviews"]) await fs.rm(path.join(dir, folder), { recursive: true, force: true });
-  for (const file of ["request.md", "plan.json", "plan.md", "state.json", "usage.json"]) await fs.rm(path.join(dir, file), { force: true });
+  for (const file of ["request.md", "plan.json", "plan.md", "state.json", "usage.json", "usage.jsonl"]) await fs.rm(path.join(dir, file), { force: true });
   return state;
 }
 
@@ -709,6 +1051,7 @@ async function expandBundleForReview(dir, bundle) {
   await writeText(path.join(dir, "request.md"), bundle.request || "# Restored request");
   await writeText(path.join(dir, "plan.md"), planDocument(bundle.plan, bundle.state));
   await writeJson(path.join(dir, "usage.json"), bundle.usage || { calls: [], totals: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, byPhase: {} });
+  await fs.rm(path.join(dir, "usage.jsonl"), { force: true });
   for (const task of bundle.plan.tasks) {
     const policy = TOKEN_POLICIES[bundle.state.tokenMode] || TOKEN_POLICIES.economy;
     await writeText(path.join(dir, "tasks", `${task.id}.prompt.md`), bundle.prompts?.[task.id] || promptDocument(bundle.state.goal, bundle.plan, task, policy));
@@ -716,6 +1059,7 @@ async function expandBundleForReview(dir, bundle) {
     if (bundle.reviews?.[task.id]) await writeText(path.join(dir, "reviews", `${task.id}.review.md`), bundle.reviews[task.id]);
   }
   if (bundle.finalReview) await writeText(path.join(dir, "final-review.md"), bundle.finalReview);
+  await fs.rm(path.join(dir, "run-bundle.json"), { force: true });
 }
 
 function estimateTokens(value) {
@@ -726,6 +1070,10 @@ function estimateTokens(value) {
     else nonAscii += 1;
   }
   return Math.max(1, Math.ceil(ascii / 4 + nonAscii / 1.5));
+}
+
+function estimateMessageTokens(messages) {
+  return messages.reduce((total, message) => total + estimateTokens(message.role) + estimateTokens(message.content) + 4, 0);
 }
 
 async function callModel(config, profileName, messages, temperature = 0.2, options = {}) {
@@ -743,6 +1091,7 @@ async function callModel(config, profileName, messages, temperature = 0.2, optio
   const effort = selectedReasoning(config, profileName, options);
   if (effort !== "default" && profile.reasoningField) body[profile.reasoningField] = effort;
   if (profile.maxTokensField) body[profile.maxTokensField] = outputBudget(config, profile, options);
+  const requestBody = JSON.stringify(body);
   for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
@@ -751,9 +1100,9 @@ async function callModel(config, profileName, messages, temperature = 0.2, optio
         method: "POST",
         headers,
         signal: controller.signal,
-        body: JSON.stringify(body)
+        body: requestBody
       });
-      const raw = await response.text();
+      const raw = await readResponseTextBounded(response, response.ok ? MAX_MODEL_RESPONSE_BYTES : MAX_ERROR_RESPONSE_BYTES);
       if (!response.ok) {
         const error = new Error(`${profileName} returned HTTP ${response.status}: ${raw.slice(0, 300)}`);
         error.retryable = [408, 409, 425, 429].includes(response.status) || response.status >= 500;
@@ -764,7 +1113,7 @@ async function callModel(config, profileName, messages, temperature = 0.2, optio
       const content = payload.choices?.[0]?.message?.content ?? payload.output_text;
       if (typeof content !== "string" || !content.trim()) throw new Error(`${profileName} returned no text content`);
       const reported = payload.usage || {};
-      const promptTokens = Number(reported.prompt_tokens ?? reported.input_tokens) || estimateTokens(JSON.stringify(messages));
+      const promptTokens = Number(reported.prompt_tokens ?? reported.input_tokens) || estimateMessageTokens(messages);
       const completionTokens = Number(reported.completion_tokens ?? reported.output_tokens) || estimateTokens(content);
       await recordUsage(options.usageFile, {
         at: new Date().toISOString(),
@@ -984,17 +1333,33 @@ async function nextProjectId(workspace, config) {
     const lockFile = path.join(controlRoot(workspace), "counter.lock");
     const lock = await acquireFileLock(lockFile);
     let current = 0;
+    let counterTrusted = false;
     try {
-      try { current = Number((await readJson(file)).lastProjectNumber) || 0; }
-      catch (error) { if (error.code !== "ENOENT") throw error; }
       try {
-        const entries = await fs.readdir(artifactRoot(workspace, config), { withFileTypes: true });
-        for (const entry of entries) {
-          if (!entry.isDirectory()) continue;
-          const number = Number(entry.name.match(/^P(\d+)$/)?.[1]) || 0;
-          current = Math.max(current, number);
+        const stored = Number((await readJson(file)).lastProjectNumber);
+        if (Number.isInteger(stored) && stored >= 0) {
+          current = stored;
+          counterTrusted = true;
         }
-      } catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      let needsScan = !counterTrusted;
+      if (!needsScan) {
+        const candidate = path.join(artifactRoot(workspace, config), `P${String(current + 1).padStart(4, "0")}`);
+        try { await fs.access(candidate); needsScan = true; }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
+      if (needsScan) {
+        let directory;
+        try { directory = await fs.opendir(artifactRoot(workspace, config)); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        if (directory) {
+          for await (const entry of directory) {
+            const number = Number(entry.name.match(/^P(\d+)$/)?.[1]) || 0;
+            current = Math.max(current, number);
+          }
+        }
+      }
       current += 1;
       await writeJsonAtomic(file, { lastProjectNumber: current });
       projectId = `P${String(current).padStart(4, "0")}`;
@@ -1023,7 +1388,7 @@ function chatCard(dir, state, plan, config, stage) {
     `/gaol ${compactText(state.goal, 320)}`,
     "",
     `### 项目 ${state.projectId} · ${state.projectName} · 批次 B${String(state.batchNumber || 1).padStart(2, "0")}`,
-    `状态：${stage || state.status}｜任务：${plan.tasks.length}｜后端：${state.executionBackend || selectedExecutionBackend(config)}｜Token：${state.tokenMode || config.tokenMode}｜归档：${state.artifactMode || config.artifactMode}｜目录：${dir}`,
+    `状态：${stage || state.status}｜任务：${plan.tasks.length}｜后端：${state.executionBackend || selectedExecutionBackend(config)}｜Token：${state.tokenMode || config.tokenMode}｜归档：${state.artifactMode || config.artifactMode}｜压缩：${state.compaction?.mode || "pending"}｜目录：${dir}`,
     ""
   ];
   for (const task of plan.tasks) {
@@ -1108,8 +1473,12 @@ function promptDocument(goal, plan, task, policy = TOKEN_POLICIES.economy) {
 }
 
 async function createPlan(args) {
+  if (typeof args.goal !== "string" || !args.goal.trim()) throw new Error("goal must be a non-empty string");
+  if (args.goal.length > MAX_GOAL_CHARS) throw new Error(`goal exceeds ${MAX_GOAL_CHARS} characters; keep large content in workspace files and pass their paths.`);
+  if (typeof args.context === "string" && args.context.length > MAX_CONTEXT_CHARS) throw new Error(`context exceeds ${MAX_CONTEXT_CHARS} characters; keep large content in workspace files and pass their paths.`);
   const workspace = workspaceRoot(args.workspace);
   const config = await loadConfig(workspace);
+  requireEnabled(config);
   const count = requestedCount(args, config);
   const projectId = await nextProjectId(workspace, config);
   const id = runId(args.goal);
@@ -1118,7 +1487,7 @@ async function createPlan(args) {
   await fs.mkdir(path.join(dir, "tasks"), { recursive: true });
   await fs.mkdir(path.join(dir, "results"), { recursive: true });
   await fs.mkdir(path.join(dir, "reviews"), { recursive: true });
-  const runOptions = { ...args, tokenMode: args.tokenMode || config.tokenMode, usageFile: path.join(dir, "usage.json"), phase: "planning" };
+  const runOptions = { ...args, tokenMode: args.tokenMode || config.tokenMode, usageFile: path.join(dir, "usage.jsonl"), phase: "planning" };
   let raw;
   try {
     raw = await callJson(config, config.solModel, planningMessages(args.goal, args.context, count, config, runOptions), runOptions);
@@ -1204,7 +1573,7 @@ async function prepareHostAgentRun(created, args = {}) {
       continue;
     }
     const resultPath = path.join(dir, "results", `${task.id}.result.md`);
-    if (await readOptionalText(resultPath)) {
+    if (await hasNonEmptyFile(resultPath)) {
       state.tasks[task.id] = { ...state.tasks[task.id], status: "result_ready", resultPath };
       resultsReady += 1;
       continue;
@@ -1235,7 +1604,7 @@ async function prepareHostAgentRun(created, args = {}) {
       sharedWorkspaceAccess: "read-only",
       exclusiveWritePath: resultPath
     };
-    const originalPrompt = await readOptionalText(packet.promptPath);
+    const originalPrompt = await readTextPreview(packet.promptPath, 128000, true);
     const dependencyResults = await dependencyContext(dir, task, config, args);
     const conversationHeader = [
       `# ${conversationTitle}`,
@@ -1283,7 +1652,7 @@ async function dependencyContext(dir, task, config, options) {
   const policy = tokenPolicy(config, options);
   const parts = [];
   for (const id of task.dependsOn) {
-    const value = await fs.readFile(path.join(dir, "results", `${id}.result.md`), "utf8");
+    const value = await readTextPreview(path.join(dir, "results", `${id}.result.md`), policy.dependencyChars);
     parts.push(`## Dependency ${id}\n${clipped(value, policy.dependencyChars)}`);
   }
   return parts.join("\n\n");
@@ -1431,7 +1800,7 @@ async function executeRun(created, args) {
   const { runDirectory: dir, config, plan } = created;
   const stateFile = path.join(dir, "state.json");
   const state = await readJson(stateFile);
-  const runOptions = { ...args, executionBackend: "api-parallel", tokenMode: args.tokenMode || state.tokenMode || config.tokenMode, usageFile: path.join(dir, "usage.json") };
+  const runOptions = { ...args, executionBackend: "api-parallel", tokenMode: args.tokenMode || state.tokenMode || config.tokenMode, usageFile: path.join(dir, "usage.jsonl") };
   state.status = "running";
   state.executionBackend = "api-parallel";
   state.tokenMode = runOptions.tokenMode;
@@ -1439,12 +1808,7 @@ async function executeRun(created, args) {
   state.reviewReasoning = selectedReasoning(config, config.reviewModel, runOptions);
   state.reviewModelId = config.models[config.reviewModel]?.model;
   state.startedAt = new Date().toISOString();
-  await writeJson(stateFile, state);
-  let stateWrite = Promise.resolve();
-  const persistState = () => {
-    stateWrite = stateWrite.then(() => writeJson(stateFile, state));
-    return stateWrite;
-  };
+  await writeJsonAtomic(stateFile, state);
   const complete = new Set(plan.tasks.filter((task) => state.tasks[task.id]?.status === "approved").map((task) => task.id));
   const failed = new Set();
   const pending = new Map(plan.tasks.filter((task) => !complete.has(task.id)).map((task) => [task.id, task]));
@@ -1456,7 +1820,7 @@ async function executeRun(created, args) {
       failed.add(task.id);
       pending.delete(task.id);
     }
-    if (blocked.length) await persistState();
+    if (blocked.length) await writeJsonAtomic(stateFile, state);
     if (!pending.size) break;
     const ready = [...pending.values()].filter((task) => task.dependsOn.every((id) => complete.has(id)));
     if (!ready.length) {
@@ -1465,19 +1829,22 @@ async function executeRun(created, args) {
         failed.add(task.id);
       }
       pending.clear();
-      await persistState();
+      await writeJsonAtomic(stateFile, state);
       break;
     }
     for (let offset = 0; offset < ready.length; offset += config.maxParallel) {
       const batch = ready.slice(offset, offset + config.maxParallel);
-      const executions = await Promise.all(batch.map(async (task) => {
+      const executionInputs = batch.map((task) => {
         const model = task.owner === "sol" ? config.solModel : (runOptions.workerModel || task.assignedModel || selectWorker(task, workerIndex++, runOptions, config));
         const reasoningEffort = selectedReasoning(config, model, runOptions);
         task.assignedModel = model;
         task.assignedReasoning = reasoningEffort;
         const attempts = (state.tasks[task.id]?.attempts || 0) + 1;
         state.tasks[task.id] = { ...state.tasks[task.id], status: "running", owner: task.owner, model, modelId: config.models[model]?.model, reasoningEffort, attempts, error: null };
-        await persistState();
+        return { task, model, reasoningEffort, attempts };
+      });
+      await writeJsonAtomic(stateFile, state);
+      const executions = await Promise.all(executionInputs.map(async ({ task, model, reasoningEffort, attempts }) => {
         try {
           const result = await executeTask(dir, state.goal, plan, task, model, config, runOptions);
           return { task, model, reasoningEffort, attempts, result };
@@ -1485,10 +1852,10 @@ async function executeRun(created, args) {
           state.tasks[task.id] = { ...state.tasks[task.id], status: "failed", owner: task.owner, model, modelId: config.models[model]?.model, reasoningEffort, attempts, error: compactText(error?.message || String(error), 500) };
           failed.add(task.id);
           pending.delete(task.id);
-          await persistState();
           return null;
         }
       }));
+      await writeJsonAtomic(stateFile, state);
       const completedExecutions = executions.filter(Boolean);
       if (!completedExecutions.length) continue;
       let reviews;
@@ -1501,7 +1868,7 @@ async function executeRun(created, args) {
           failed.add(task.id);
           pending.delete(task.id);
         }
-        await persistState();
+        await writeJsonAtomic(stateFile, state);
         continue;
       }
       const revisions = await Promise.all(completedExecutions.filter(({ task }) => reviews.get(task.id)?.decision === "revise").map(async (execution) => {
@@ -1545,11 +1912,10 @@ async function executeRun(created, args) {
         else failed.add(task.id);
         pending.delete(task.id);
       }
-      await persistState();
+      await writeJsonAtomic(stateFile, state);
     }
   }
-  await stateWrite;
-  await writeJson(path.join(dir, "plan.json"), plan);
+  await writeJsonAtomic(path.join(dir, "plan.json"), plan);
   if (failed.size) {
     state.status = "partial_failure";
     state.failedTasks = [...failed];
@@ -1557,7 +1923,7 @@ async function executeRun(created, args) {
     state.needsContinuation = false;
     state.usage = await readUsage(dir);
     await writeProjectDocument(state, plan, dir, config);
-    await writeJson(stateFile, state);
+    await writeJsonAtomic(stateFile, state);
     return {
       runDirectory: dir,
       projectId: state.projectId,
@@ -1576,21 +1942,21 @@ async function finalizeReview(dir, config, options = {}) {
   const plan = await readJson(path.join(dir, "plan.json"));
   const stateFile = path.join(dir, "state.json");
   const state = await readJson(stateFile);
-  const finalOptions = { ...options, tokenMode: options.tokenMode || state.tokenMode || config.tokenMode, usageFile: options.usageFile || path.join(dir, "usage.json"), phase: "final" };
+  const finalOptions = { ...options, tokenMode: options.tokenMode || state.tokenMode || config.tokenMode, usageFile: options.usageFile || path.join(dir, "usage.jsonl"), phase: "final" };
   const policy = tokenPolicy(config, finalOptions);
   const packets = [];
   for (const task of plan.tasks) {
     const resultFile = path.join(dir, "results", `${task.id}.result.md`);
     let result;
-    try { result = await fs.readFile(resultFile, "utf8"); }
+    try { result = await readTextPreview(resultFile, policy.reviewResultChars); }
     catch (error) { if (error.code === "ENOENT") continue; throw error; }
     const reviewFile = path.join(dir, "reviews", `${task.id}.review.md`);
     let review;
-    try { review = await fs.readFile(reviewFile, "utf8"); }
+    try { review = await readTextPreview(reviewFile, Math.max(16000, policy.finalReviewChars * 2)); }
     catch (error) {
       if (error.code !== "ENOENT") throw error;
       await reviewTask(dir, state.goal, task, result, config, finalOptions);
-      review = await fs.readFile(reviewFile, "utf8");
+      review = await readTextPreview(reviewFile, Math.max(16000, policy.finalReviewChars * 2));
     }
     packets.push(`${task.id} ${task.title} | owner=${task.owner} | status=${state.tasks[task.id]?.status || "unknown"}\n${clipped(review, policy.finalReviewChars)}`);
   }
@@ -1623,8 +1989,8 @@ async function finalizeReview(dir, config, options = {}) {
   state.usage = await readUsage(dir);
   await writeProjectDocument(state, plan, dir, config);
   await writeJson(stateFile, state);
+  await compactRun(dir, state, plan, config);
   const chatDisplay = chatCard(dir, state, plan, config, state.status);
-  await compactRun(dir, state, plan);
   return { runDirectory: dir, projectId: state.projectId, status: state.status, needsContinuation: state.needsContinuation, bundle: state.bundlePath || null, finalReview: finalFile, tasks: state.tasks, usage: state.usage, chatDisplay };
 }
 
@@ -1632,10 +1998,13 @@ async function reviewRun(args) {
   const dir = path.resolve(args.runDirectory);
   let archived = null;
   try { archived = await readBundle(dir); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (archived) requireEnabled(await loadConfig(archived.state.workspace));
   if (archived) await expandBundleForReview(dir, archived);
   const state = await readJson(path.join(dir, "state.json"));
   const config = await loadConfig(state.workspace);
-  const runOptions = { ...args, tokenMode: args.tokenMode || state.tokenMode || config.tokenMode, usageFile: path.join(dir, "usage.json") };
+  requireEnabled(config);
+  const runOptions = { ...args, tokenMode: args.tokenMode || state.tokenMode || config.tokenMode, usageFile: path.join(dir, "usage.jsonl") };
+  const policy = tokenPolicy(config, runOptions);
   state.tokenMode = runOptions.tokenMode;
   state.reviewModel = config.reviewModel;
   state.reviewReasoning = selectedReasoning(config, config.reviewModel, runOptions);
@@ -1646,8 +2015,8 @@ async function reviewRun(args) {
   for (const task of plan.tasks) {
     const resultFile = path.join(dir, "results", `${task.id}.result.md`);
     try {
-      const result = await fs.readFile(resultFile, "utf8");
-      if (state.tasks[task.id]?.status === "approved" && await readOptionalText(path.join(dir, "reviews", `${task.id}.review.md`))) continue;
+      const result = await readTextPreview(resultFile, policy.reviewResultChars);
+      if (state.tasks[task.id]?.status === "approved" && await hasNonEmptyFile(path.join(dir, "reviews", `${task.id}.review.md`))) continue;
       pendingReviews.push({ task, result });
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -1671,13 +2040,15 @@ async function reviewRun(args) {
   return finalizeReview(dir, config, runOptions);
 }
 
-async function reviewSummaries(dir, plan, config, options) {
+async function reviewSummaries(dir, plan, config, options, archivedBundle = null) {
   const policy = tokenPolicy(config, options);
-  let bundle = null;
-  try { bundle = await readBundle(dir); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  let bundle = archivedBundle;
+  if (!bundle) {
+    try { bundle = await readBundle(dir); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
   const summaries = [];
   for (const task of plan.tasks) {
-    const review = bundle?.reviews?.[task.id] || await readOptionalText(path.join(dir, "reviews", `${task.id}.review.md`));
+    const review = bundle?.reviews?.[task.id] || await readTextPreview(path.join(dir, "reviews", `${task.id}.review.md`), Math.max(16000, policy.reviewSummaryChars * 4), true);
     const decision = review.match(/^Decision:\s*([^\r\n]+)/im)?.[1]?.trim() || "unknown";
     const summary = review.match(/^Decision:[^\r\n]*\r?\n+([\s\S]*?)(?=\r?\n## Progress digest|$)/im)?.[1]?.trim() || "";
     const progress = review.match(/## Progress digest\s*\r?\n+([\s\S]*?)(?=\r?\n## |$)/i)?.[1]?.trim() || "";
@@ -1715,20 +2086,32 @@ function appendProgressLedger(previousState, previousPlan, summaries, policy) {
   return next;
 }
 
-async function markContinued(dir, nextDir) {
+async function markContinued(dir, nextDir, documents = null) {
+  if (documents?.bundle) {
+    documents.bundle.state.needsContinuation = false;
+    documents.bundle.state.continuedBy = nextDir;
+    await writeJsonAtomic(path.join(dir, "run-bundle.json"), documents.bundle);
+    return;
+  }
+  if (documents?.state) {
+    documents.state.needsContinuation = false;
+    documents.state.continuedBy = nextDir;
+    await writeJsonAtomic(path.join(dir, "state.json"), documents.state);
+    return;
+  }
   try {
     const file = path.join(dir, "state.json");
     const state = await readJson(file);
     state.needsContinuation = false;
     state.continuedBy = nextDir;
-    await writeJson(file, state);
+    await writeJsonAtomic(file, state);
     return;
   } catch (error) { if (error.code !== "ENOENT") throw error; }
   const file = path.join(dir, "run-bundle.json");
   const bundle = await readJson(file);
   bundle.state.needsContinuation = false;
   bundle.state.continuedBy = nextDir;
-  await writeJson(file, bundle);
+  await writeJsonAtomic(file, bundle);
 }
 
 function continuationMessages(state, plan, summaries, count, config, options) {
@@ -1780,8 +2163,7 @@ async function verifyGoalCompletion(state, raw, evidence, summaries, config, opt
 async function existingContinuation(previousState) {
   if (!previousState.continuedBy) return null;
   const dir = path.resolve(previousState.continuedBy);
-  const state = await readRunState(dir);
-  const plan = await readRunPlan(dir);
+  const { state, plan } = await readRunDocuments(dir);
   const config = await loadConfig(state.workspace);
   return {
     runDirectory: dir,
@@ -1796,10 +2178,12 @@ async function existingContinuation(previousState) {
 
 async function continueGoal(args) {
   const previousDir = path.resolve(args.runDirectory);
-  let previousState = await readRunState(previousDir);
+  let previousDocuments = await readRunDocuments(previousDir);
+  let previousState = previousDocuments.state;
+  const lockConfig = await loadConfig(previousState.workspace);
+  requireEnabled(lockConfig);
   const existing = await existingContinuation(previousState);
   if (existing) return existing;
-  const lockConfig = await loadConfig(previousState.workspace);
   const lockRoot = previousState.projectRoot || path.dirname(previousDir);
   const lockFile = path.join(lockRoot, `.continue-${createHash("sha256").update(previousDir).digest("hex").slice(0, 12)}.lock`);
   let lock;
@@ -1814,26 +2198,28 @@ async function continueGoal(args) {
       await fs.rm(lockFile, { force: true });
       return continueGoal(args);
     }
-    previousState = await readRunState(previousDir);
+    previousDocuments = await readRunDocuments(previousDir);
+    previousState = previousDocuments.state;
     const completed = await existingContinuation(previousState);
     if (completed) return completed;
     return { runDirectory: previousDir, projectId: previousState.projectId, status: "continuation_in_progress", idempotent: true, message: "Another continuation call is already creating the next batch." };
   }
   try {
-    return await continueGoalUnlocked(args);
+    return await continueGoalUnlocked(args, previousDocuments);
   } finally {
     await lock.close();
     await fs.rm(lockFile, { force: true });
   }
 }
 
-async function continueGoalUnlocked(args) {
+async function continueGoalUnlocked(args, loadedDocuments = null) {
   const previousDir = path.resolve(args.runDirectory);
-  const previousState = await readRunState(previousDir);
+  const previousDocuments = loadedDocuments || await readRunDocuments(previousDir);
+  const previousState = previousDocuments.state;
   if (!previousState.longRunning) throw new Error("This run is not marked longRunning. Start /gaol with longRunning: true.");
   if (!["approved", "review_required"].includes(previousState.status)) throw new Error(`Run must be reviewed before continuation; current status is '${previousState.status}'`);
   const config = await loadConfig(previousState.workspace);
-  const previousPlan = await readRunPlan(previousDir);
+  const previousPlan = previousDocuments.plan;
   const completedSignatures = completedTaskSignatures(previousState, previousPlan);
   const count = requestedCount(args, config);
   const id = runId(previousState.goal);
@@ -1843,8 +2229,8 @@ async function continueGoalUnlocked(args) {
   await fs.mkdir(path.join(dir, "tasks"), { recursive: true });
   await fs.mkdir(path.join(dir, "results"), { recursive: true });
   await fs.mkdir(path.join(dir, "reviews"), { recursive: true });
-  const runOptions = { ...args, tokenMode: args.tokenMode || previousState.tokenMode || config.tokenMode, usageFile: path.join(dir, "usage.json"), phase: "planning" };
-  const summaries = await reviewSummaries(previousDir, previousPlan, config, runOptions);
+  const runOptions = { ...args, tokenMode: args.tokenMode || previousState.tokenMode || config.tokenMode, usageFile: path.join(dir, "usage.jsonl"), phase: "planning" };
+  const summaries = await reviewSummaries(previousDir, previousPlan, config, runOptions, previousDocuments.bundle);
   const policy = tokenPolicy(config, runOptions);
   const progressLedger = appendProgressLedger(previousState, previousPlan, summaries, policy);
   let raw;
@@ -1916,9 +2302,9 @@ async function continueGoalUnlocked(args) {
     await writeText(finalFile, `# ${state.projectId}: Goal Complete\n\n/gaol ${state.goal}\n\n## Evidence\n\n${evidence.map((item) => `- ${item}`).join("\n")}\n\n## Independent verification\n\n${completionVerification.summary}`);
     await writeProjectDocument(state, plan, dir, config);
     await writeJson(path.join(dir, "state.json"), state);
+    await compactRun(dir, state, plan, config);
     const chatDisplay = chatCard(dir, state, plan, config, state.status);
-    await compactRun(dir, state, plan);
-    await markContinued(previousDir, dir);
+    await markContinued(previousDir, dir, previousDocuments);
     return { runDirectory: dir, projectId: state.projectId, status: state.status, goalComplete: true, bundle: state.bundlePath || null, chatDisplay };
   }
   let deduplicated = deduplicatePlan(
@@ -1964,16 +2350,13 @@ async function continueGoalUnlocked(args) {
   for (const task of plan.tasks) await writeText(path.join(dir, "tasks", `${task.id}.prompt.md`), promptDocument(state.goal, plan, task, promptPolicy));
   await writeProjectDocument(state, plan, dir, config);
   await writeJson(path.join(dir, "state.json"), state);
-  await markContinued(previousDir, dir);
+  await markContinued(previousDir, dir, previousDocuments);
   return { runDirectory: dir, projectId: state.projectId, status: "planned", goalComplete: false, batchNumber, taskCount: plan.tasks.length, chatDisplay: chatCard(dir, state, plan, config, "planned") };
 }
 
 async function statusRun(args) {
   const dir = path.resolve(args.runDirectory);
-  const state = await readRunState(dir);
-  const plan = await readRunPlan(dir);
-  let bundle = null;
-  try { bundle = await readBundle(dir); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  const { state, plan, bundle } = await readRunDocuments(dir);
   const missingResults = [];
   for (const task of plan.tasks) {
     if (bundle) {
@@ -1983,18 +2366,19 @@ async function statusRun(args) {
       catch { missingResults.push(task.id); }
     }
   }
-  state.usage = bundle?.usage || await readUsage(dir);
   const config = await loadConfig(state.workspace);
+  requireEnabled(config);
+  state.usage = bundle?.usage || state.usage || await readUsage(dir);
   return { runDirectory: dir, state, missingResults, chatDisplay: chatCard(dir, state, plan, config, state.status) };
 }
 
 async function resumeRun(args) {
   const dir = path.resolve(args.runDirectory);
-  const state = await readRunState(dir);
+  const { state, plan } = await readRunDocuments(dir);
+  const config = await loadConfig(state.workspace);
+  requireEnabled(config);
   const allowed = ["partial_failure", "running", "awaiting_host_agents", "host_results_ready", "host_dispatch_blocked", "missing_results"];
   if (!allowed.includes(state.status)) throw new Error(`Run ${state.projectId || state.runId} is '${state.status}' and does not need resume_run`);
-  const config = await loadConfig(state.workspace);
-  const plan = await readRunPlan(dir);
   state.status = "planned";
   state.resumable = false;
   state.failedTasks = [];
@@ -2002,8 +2386,8 @@ async function resumeRun(args) {
     if (state.tasks[task.id]?.status === "approved") continue;
     const resultFile = path.join(dir, "results", `${task.id}.result.md`);
     const reviewFile = path.join(dir, "reviews", `${task.id}.review.md`);
-    const existingReview = await readOptionalText(reviewFile);
-    if (existingReview.includes("Decision: approved") && await readOptionalText(resultFile)) {
+    const existingReview = await readTextPreview(reviewFile, 4096, true);
+    if (existingReview.includes("Decision: approved") && await hasNonEmptyFile(resultFile)) {
       state.tasks[task.id] = { ...state.tasks[task.id], status: "approved", error: null };
       continue;
     }
@@ -2018,10 +2402,10 @@ async function resumeRun(args) {
 
 async function executeExistingRun(args) {
   const dir = path.resolve(args.runDirectory);
-  const state = await readRunState(dir);
-  if (state.status !== "planned") throw new Error(`Run ${state.projectId || state.runId} is '${state.status}', not 'planned'`);
+  const { state, plan } = await readRunDocuments(dir);
   const config = await loadConfig(state.workspace);
-  const plan = await readRunPlan(dir);
+  requireEnabled(config);
+  if (state.status !== "planned") throw new Error(`Run ${state.projectId || state.runId} is '${state.status}', not 'planned'`);
   if (config.mode === "documents") {
     return { runDirectory: dir, projectId: state.projectId, status: "planned", chatDisplay: chatCard(dir, state, plan, config, "planned") };
   }
@@ -2109,6 +2493,12 @@ process.stdin.on("data", (chunk) => {
     if (!line) continue;
     try { void handle(JSON.parse(line)); }
     catch (error) { console.error(`Invalid MCP message: ${error.message}`); }
+  }
+  if (Buffer.byteLength(buffer, "utf8") > MAX_MCP_BUFFER_BYTES) {
+    console.error(`MCP message exceeded the ${MAX_MCP_BUFFER_BYTES}-byte safety limit; pass large workspace files by path.`);
+    buffer = "";
+    process.exitCode = 1;
+    process.stdin.destroy();
   }
 });
 

@@ -1,7 +1,7 @@
 interface:
   display_name: "Sol Orchestrator"
-  short_description: "Resumable Sol goals with host-agent task conversations"
-  default_prompt: "Use $sol-orchestrator. Open the Chinese model configuration window when visual selection is requested; otherwise run this /gaol with host-agent task conversations when available, resumable checkpoints, and independent completion review."
+  short_description: "Default-on conversation routing with a complete off switch"
+  default_prompt: "Use $sol-orchestrator at conversation start. Read enabled state, route direct work locally, orchestrate only when justified, and do nothing when the workspace switch is off."
 dependencies:
   tools:
     - type: "mcp"

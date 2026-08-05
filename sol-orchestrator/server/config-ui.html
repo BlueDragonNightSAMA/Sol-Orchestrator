@@ -3,14 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sol Orchestrator 模型配置</title>
+  <title>Sol Orchestrator 调节台</title>
   <link rel="stylesheet" href="/config-ui.css">
 </head>
 <body>
   <header class="topbar">
-    <div>
-      <p class="product">Sol Orchestrator</p>
-      <h1>模型配置</h1>
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true">S</span>
+      <div>
+        <p class="product">Sol Orchestrator</p>
+        <h1>编排调节台</h1>
+      </div>
     </div>
     <div id="connection-status" class="status" data-state="loading">正在连接</div>
   </header>
@@ -21,14 +24,109 @@
       <strong id="workspace">-</strong>
     </div>
 
-    <nav class="tabs" aria-label="配置分类">
-      <button class="tab active" type="button" data-tab="models" aria-selected="true">角色与模型</button>
-      <button class="tab" type="button" data-tab="execution" aria-selected="false">执行策略</button>
-      <button class="tab" type="button" data-tab="endpoints" aria-selected="false">端点参数</button>
+    <nav class="tabs" role="tablist" aria-label="配置分类">
+      <button id="tab-overview" class="tab active" type="button" role="tab" data-tab="overview" aria-controls="panel-overview" aria-selected="true">总览</button>
+      <button id="tab-models" class="tab" type="button" role="tab" data-tab="models" aria-controls="panel-models" aria-selected="false">角色与模型</button>
+      <button id="tab-execution" class="tab" type="button" role="tab" data-tab="execution" aria-controls="panel-execution" aria-selected="false">执行策略</button>
+      <button id="tab-endpoints" class="tab" type="button" role="tab" data-tab="endpoints" aria-controls="panel-endpoints" aria-selected="false">端点参数</button>
     </nav>
 
     <form id="config-form">
-      <section class="panel active" data-panel="models">
+      <section id="panel-overview" class="panel active" role="tabpanel" aria-labelledby="tab-overview" data-panel="overview">
+        <div class="master-control">
+          <div>
+            <strong>全局分类与编排</strong>
+            <span>每次对话</span>
+          </div>
+          <label class="master-toggle">
+            <input id="enabled" type="checkbox" checked>
+            <span id="enabled-state">已启用</span>
+          </label>
+        </div>
+
+        <div class="section-heading">
+          <div>
+            <p class="section-index">LIVE</p>
+            <h2>运行链路</h2>
+          </div>
+          <p id="routing-summary" class="section-note">正在读取配置</p>
+        </div>
+
+        <div id="orchestrator-map" class="orchestration-map" role="img" aria-label="Sol 规划、工作模型并行执行、审查模型验收的实时编排预览">
+          <div class="stage stage-sol">
+            <span class="stage-kicker">规划与整合</span>
+            <strong id="preview-sol">-</strong>
+            <span id="preview-sol-effort" class="stage-detail">-</span>
+          </div>
+          <div class="flow-link" aria-hidden="true"><span></span></div>
+          <div class="stage stage-workers">
+            <span class="stage-kicker">并行执行</span>
+            <strong id="preview-workers">-</strong>
+            <span id="preview-worker-effort" class="stage-detail">-</span>
+          </div>
+          <div class="flow-link" aria-hidden="true"><span></span></div>
+          <div class="stage stage-review">
+            <span class="stage-kicker">独立审查</span>
+            <strong id="preview-review">-</strong>
+            <span id="preview-review-effort" class="stage-detail">-</span>
+          </div>
+        </div>
+
+        <div class="viz-grid summary-grid" aria-label="当前运行摘要">
+          <article class="summary-card">
+            <span>每批任务</span>
+            <strong id="summary-tasks">-</strong>
+            <small id="summary-task-limit">-</small>
+          </article>
+          <article class="summary-card">
+            <span>最大并发</span>
+            <strong id="summary-parallel">-</strong>
+            <small id="summary-backend">-</small>
+          </article>
+          <article class="summary-card">
+            <span>工作输出预算</span>
+            <strong id="summary-budget">-</strong>
+            <small id="summary-token-mode">-</small>
+          </article>
+        </div>
+
+        <div class="overview-settings">
+          <fieldset class="token-fieldset">
+            <legend>Token 模式</legend>
+            <div class="segments" data-segments="token">
+              <label><input type="radio" name="token-mode" value="economy"><span>经济</span></label>
+              <label><input type="radio" name="token-mode" value="balanced"><span>均衡</span></label>
+              <label><input type="radio" name="token-mode" value="quality"><span>质量</span></label>
+            </div>
+          </fieldset>
+          <label>
+            <span>执行后端</span>
+            <select id="execution-backend">
+              <option value="auto">自动选择</option>
+              <option value="host-agents">Codex 子代理</option>
+              <option value="api-parallel">API 并发</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="budget-section">
+          <div class="section-heading compact-heading">
+            <div>
+              <p class="section-index">BUDGET</p>
+              <h2>单次调用输出上限</h2>
+            </div>
+            <p id="review-batch-summary" class="section-note">-</p>
+          </div>
+          <div class="budget-chart" aria-label="当前 Token 模式各阶段输出上限">
+            <div class="budget-row"><span>规划</span><div class="budget-track"><i data-budget="planning"></i></div><strong data-budget-value="planning">-</strong></div>
+            <div class="budget-row"><span>执行</span><div class="budget-track"><i data-budget="worker"></i></div><strong data-budget-value="worker">-</strong></div>
+            <div class="budget-row"><span>审查</span><div class="budget-track"><i data-budget="review"></i></div><strong data-budget-value="review">-</strong></div>
+            <div class="budget-row"><span>汇总</span><div class="budget-track"><i data-budget="final"></i></div><strong data-budget-value="final">-</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-models" class="panel" role="tabpanel" aria-labelledby="tab-models" data-panel="models" hidden>
         <div class="section-heading">
           <div>
             <p class="section-index">01</p>
@@ -55,16 +153,16 @@
             <p class="section-index">02</p>
             <h2>模型列表</h2>
           </div>
-          <button id="add-profile" class="icon-button" type="button" title="添加模型配置" aria-label="添加模型配置">+</button>
+          <button id="add-profile" class="secondary-button" type="button"><span aria-hidden="true">+</span> 添加模型</button>
         </div>
         <div id="profile-list" class="profile-list"></div>
       </section>
 
-      <section class="panel" data-panel="execution" hidden>
+      <section id="panel-execution" class="panel" role="tabpanel" aria-labelledby="tab-execution" data-panel="execution" hidden>
         <div class="section-heading">
           <div>
             <p class="section-index">03</p>
-            <h2>运行方式</h2>
+            <h2>运行与归档</h2>
           </div>
         </div>
         <div class="field-grid three">
@@ -73,34 +171,21 @@
             <select id="mode">
               <option value="auto">自动</option>
               <option value="manual">手动</option>
-              <option value="documents">仅文档</option>
-            </select>
-          </label>
-          <label>
-            <span>执行后端</span>
-            <select id="execution-backend">
-              <option value="auto">自动</option>
-              <option value="host-agents">子对话</option>
-              <option value="api-parallel">API 并发</option>
+              <option value="documents">仅生成文档</option>
             </select>
           </label>
           <label>
             <span>归档模式</span>
             <select id="artifact-mode">
-              <option value="compact">精简</option>
-              <option value="expanded">完整</option>
+              <option value="compact">精简归档</option>
+              <option value="expanded">保留全部文件</option>
             </select>
           </label>
+          <label>
+            <span>项目文档目录</span>
+            <input id="artifact-directory" type="text" required maxlength="240" autocomplete="off">
+          </label>
         </div>
-
-        <fieldset class="token-fieldset">
-          <legend>Token 模式</legend>
-          <div class="segments">
-            <label><input type="radio" name="token-mode" value="economy"><span>经济</span></label>
-            <label><input type="radio" name="token-mode" value="balanced"><span>均衡</span></label>
-            <label><input type="radio" name="token-mode" value="quality"><span>质量</span></label>
-          </div>
-        </fieldset>
 
         <div class="section-heading compact-heading">
           <div>
@@ -110,51 +195,52 @@
         </div>
         <div class="task-layout">
           <label class="auto-toggle">
-            <span>任务数自动</span>
+            <span>任务数由 Sol 决定</span>
             <input id="task-auto" type="checkbox">
           </label>
-          <label>
-            <span>每批任务数</span>
-            <input id="tasks-per-batch" type="number" min="1" max="64" value="2">
+          <label class="range-field">
+            <span>每批任务数 <output id="tasks-per-batch-value">2</output></span>
+            <input id="tasks-per-batch" type="range" min="1" max="64" value="2">
           </label>
-          <label>
-            <span>单批上限</span>
-            <input id="max-tasks" type="number" min="1" max="64">
+          <label class="range-field">
+            <span>单批上限 <output id="max-tasks-value">8</output></span>
+            <input id="max-tasks" type="range" min="1" max="64" value="8">
           </label>
-          <label>
-            <span>最大并发</span>
-            <input id="max-parallel" type="number" min="1" max="16">
+          <label class="range-field">
+            <span>最大并发 <output id="max-parallel-value">2</output></span>
+            <input id="max-parallel" type="range" min="1" max="16" value="2">
           </label>
         </div>
 
         <div class="section-heading compact-heading">
           <div>
             <p class="section-index">05</p>
-            <h2>重试</h2>
+            <h2>超时与重试</h2>
           </div>
         </div>
         <div class="field-grid three">
-          <label>
-            <span>请求超时（毫秒）</span>
-            <input id="request-timeout" type="number" min="1000" max="1800000" step="1000">
+          <label class="range-field">
+            <span>请求超时 <output id="request-timeout-value">180 秒</output></span>
+            <input id="request-timeout" type="range" min="1000" max="1800000" step="1000" value="180000">
           </label>
-          <label>
-            <span>最大重试</span>
-            <input id="max-retries" type="number" min="0" max="8">
+          <label class="range-field">
+            <span>最大重试 <output id="max-retries-value">2 次</output></span>
+            <input id="max-retries" type="range" min="0" max="8" value="2">
           </label>
-          <label>
-            <span>退避基数（毫秒）</span>
-            <input id="retry-base" type="number" min="100" max="30000" step="50">
+          <label class="range-field">
+            <span>退避基数 <output id="retry-base-value">0.75 秒</output></span>
+            <input id="retry-base" type="range" min="100" max="30000" step="50" value="750">
           </label>
         </div>
       </section>
 
-      <section class="panel" data-panel="endpoints" hidden>
+      <section id="panel-endpoints" class="panel" role="tabpanel" aria-labelledby="tab-endpoints" data-panel="endpoints" hidden>
         <div class="section-heading">
           <div>
             <p class="section-index">06</p>
             <h2>接口设置</h2>
           </div>
+          <p class="section-note">连接测试只读取模型列表，生成 Token 为 0</p>
         </div>
         <div id="endpoint-list" class="endpoint-list"></div>
       </section>
@@ -162,7 +248,7 @@
       <div class="actionbar">
         <p id="message" role="status" aria-live="polite"></p>
         <div class="action-buttons">
-          <button id="reload" class="icon-button" type="button" title="重新载入已保存配置" aria-label="重新载入已保存配置">↻</button>
+          <button id="reload" class="secondary-button" type="button"><span aria-hidden="true">↻</span> 重新载入</button>
           <button id="save" class="primary-button" type="submit" disabled>保存配置</button>
         </div>
       </div>
@@ -173,11 +259,11 @@
     <article class="profile-row">
       <label>
         <span>配置名称</span>
-        <input data-field="name" type="text" required>
+        <input data-field="name" type="text" required maxlength="128">
       </label>
       <label>
         <span>模型 ID</span>
-        <input data-field="model" type="text" required>
+        <input data-field="model" type="text" required maxlength="512">
       </label>
       <label>
         <span>推理强度</span>
@@ -191,41 +277,45 @@
           <option value="xhigh">极高</option>
         </select>
       </label>
-      <button class="remove-profile icon-button" type="button" title="删除模型配置" aria-label="删除模型配置">×</button>
+      <button class="remove-profile icon-button" type="button" data-tooltip="删除模型配置" aria-label="删除模型配置">×</button>
     </article>
   </template>
 
   <template id="endpoint-template">
     <article class="endpoint-row">
       <div class="endpoint-title">
-        <div>
+        <div class="endpoint-identity">
           <strong data-label="name"></strong>
           <span data-label="model"></span>
         </div>
-        <span class="endpoint-state" data-label="state"></span>
+        <div class="endpoint-actions">
+          <span class="endpoint-state" data-label="state"></span>
+          <button class="test-profile-button" type="button">测试连接</button>
+        </div>
       </div>
       <div class="field-grid two">
         <label class="wide">
           <span>Base URL</span>
-          <input data-field="baseUrl" type="url" placeholder="http://127.0.0.1:8000/v1">
+          <input data-field="baseUrl" type="url" maxlength="2048" placeholder="http://127.0.0.1:8000/v1">
         </label>
         <label>
           <span>API Key 环境变量</span>
-          <input data-field="apiKeyEnv" type="text" autocomplete="off">
+          <input data-field="apiKeyEnv" type="text" maxlength="128" autocomplete="off">
         </label>
         <label>
           <span>推理字段</span>
-          <input data-field="reasoningField" type="text">
+          <input data-field="reasoningField" type="text" maxlength="128">
         </label>
         <label>
           <span>Token 上限字段</span>
-          <input data-field="maxTokensField" type="text">
+          <input data-field="maxTokensField" type="text" maxlength="128">
         </label>
         <label class="inline-check">
           <input data-field="temperatureEnabled" type="checkbox">
           <span>发送 Temperature</span>
         </label>
       </div>
+      <p class="endpoint-detail" data-label="detail" role="status" aria-live="polite"></p>
     </article>
   </template>
 
